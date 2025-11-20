@@ -100,6 +100,11 @@ export default {
         msg_info: '',
         loading_generate: false,
         kelainan_count: [],
+        loading_create_db: false,
+        create_db_progress: 0,
+        create_db_message: '',
+        selected_mgm_mcu_id: 0,
+        dialog_confirm_create_db: false,
     },
     mutations: {
         update_open_dialog_info(state, val) {
@@ -385,6 +390,18 @@ export default {
         update_selected_mgm_mcu_id(state, val) {
             state.selected_mgm_mcu_id = val
         },
+        update_loading_create_db(state, val) {
+            state.loading_create_db = val;
+        },
+        update_create_db_progress(state, val) {
+            state.create_db_progress = val;
+        },
+        update_create_db_message(state, val) {
+            state.create_db_message = val;
+        },
+        update_dialog_confirm_create_db(state, val) {
+            state.dialog_confirm_create_db = val;
+        }
     },
     actions: {
         async getmgmmcu(context) {
@@ -441,40 +458,6 @@ export default {
             }
         },
         
-        async search(context, prm) {
-            context.commit("update_search_patient", 1)
-            try {
-                prm.token = one_token()
-                prm.mgm_mcuid = context.state.selected_mgmmcu.Mgm_McuID
-                let resp = await api.search(prm)
-                if (resp.status != "OK") {
-                    context.commit("update_search_patient", 3)
-                    context.commit("update_search_error_message", resp.message)
-                } else {
-                    context.commit("update_search_patient", 2)
-                    context.commit("update_search_error_message", "")
-                    let data = {
-                        records: resp.data.records,
-                        total: resp.data.total
-                    }
-                    context.commit("update_patients", data.records)
-                    context.commit("update_total_patient", data.total)
-                    context.commit("update_no_save", 0)
-
-                    // ✅ TAMBAHKAN INI: Panggil getcountkelainan setiap kali search
-                    if (context.state.selected_mgmmcu && context.state.selected_mgmmcu.Mgm_McuID) {
-                        context.dispatch("getcountkelainan", {
-                            mgm_mcu_id: context.state.selected_mgmmcu.Mgm_McuID
-                        })
-                    }
-                }
-            } catch (e) {
-                context.commit("update_search_patient", 3)
-                context.commit("update_search_error_message", e.message)
-                console.log(e)
-            }
-        },
-
         async getsexreg(context) {
             context.commit("update_get_data_status", 1)
             try {
@@ -518,7 +501,7 @@ export default {
                         lastid: -1
                     })
                     
-                    // ✅ TAMBAHKAN INI: Refresh kelainan count setelah upload CSV
+
                     if (context.state.selected_mgmmcu && context.state.selected_mgmmcu.Mgm_McuID) {
                         context.dispatch("getcountkelainan", {
                             mgm_mcu_id: context.state.selected_mgmmcu.Mgm_McuID
@@ -876,33 +859,120 @@ export default {
         async generateDatabase(context) {
             context.commit("update_loading_generate", true);
             try {
-                const prm = { 
-                    db_name: "cpone_corporate",
+                // Panggil API untuk generate, enkripsi, dan download file
+                const downloadPrm = { 
+                    db_name: "cpone_corporate", // Sesuai dengan logika backend
                     token: one_token()
                 };
-                const resp = await api.dumpDatabase(prm);
+                const resp = await api.downloadDatabase(downloadPrm);
 
                 if (resp.status === 200 && resp.data) {
-                    // Membuat URL dari blob
+                    // Membuat URL dari blob untuk diunduh
                     const url = window.URL.createObjectURL(new Blob([resp.data]));
                     const link = document.createElement('a');
                     link.href = url;
                     
-                    // Menentukan nama file, contoh: cpone_corporate_2023-10-27.sql
-                    const filename = `cpone_corporate_${new Date().toISOString().slice(0,10)}.sql`;
+                    // Menentukan nama file dari header atau generate nama baru
+                    const contentDisposition = resp.headers['content-disposition'];
+                    let filename = `dump_cpone_corporate.dat`; // Default filename
+                    if (contentDisposition) {
+                        const filenameMatch = contentDisposition.match(/filename="?(.+)"?/);
+                        if (filenameMatch && filenameMatch.length > 1) {
+                            filename = filenameMatch[1];
+                        }
+                    }
                     link.setAttribute('download', filename);
-                    
                     document.body.appendChild(link);
                     link.click();
-                    
-                    // Membersihkan setelah diunduh
                     document.body.removeChild(link);
                     window.URL.revokeObjectURL(url);
+                } else {
+                    throw new Error(resp.message || "Gagal mengunduh file terenkripsi.");
                 }
             } catch (e) {
                 console.error("Error generating database dump:", e);
             } finally {
                 context.commit("update_loading_generate", false);
+            }
+        },
+
+        async truncateDatabaseAction(context, prm) {
+            context.commit("update_loading_create_db", true);
+            context.commit("update_create_db_message", "Menghapus data lama...");
+            try {
+                const apiParams = { 
+                    Mgm_McuID: prm.mgm_mcu_id,
+                    confirm_truncate: prm.confirm_truncate,
+                    token: one_token() 
+                };
+                const resp = await api.truncateDatabase(apiParams);
+                if (resp.status !== "OK") {
+                    throw new Error(`Gagal menghapus data lama: ${resp.message}`);
+                }
+                return true;
+            } catch (e) {
+                console.error("Error during truncate operation:", e);
+                context.commit("update_msg_info", e.message);
+                context.commit("update_open_dialog_info", true);
+                context.commit("update_loading_create_db", false);
+                return false;
+            }
+        },
+
+        async createDatabase(context, prm) {
+            // context.commit("update_loading_create_db", true);
+            context.commit("update_create_db_progress", 0);
+            const apiCalls = [
+                { func: api.generateTable, name: "Table Setup" },
+                { func: api.generateKelainanLab, name: "Kelainan Lab" },
+                { func: api.generateKelainanNonLab, name: "Kelainan Non-Lab" },
+                { func: api.generateKelainanFisik, name: "Kelainan Fisik" },
+                { func: api.generateKelainanSummary, name: "Kelainan Summary" },
+                { func: api.generateKelainanResultMcuLab, name: "Result MCU Lab" },
+                { func: api.generateKelainanResultMcuNonLab, name: "Result MCU Non-Lab" },
+                { func: api.generateResultMcuKenalWarna, name: "Result MCU Kenal Warna" },
+                { func: api.generateResultMcuVisus, name: "Result MCU Visus" },
+                { func: api.generateResultStatusGizi, name: "Result Status Gizi" },
+                { func: api.generateResultMcuBodyFatMonitoring, name: "Result Body Fat Monitoring" },
+                { func: api.generateResultMcuFisik, name: "Result MCU Fisik" },
+                { func: api.generateAllResult, name: "All Results" }
+            ];
+
+            try {
+                for (let i = 0; i < apiCalls.length; i++) {
+                    const call = apiCalls[i];
+                    const progressMessage = `Step ${i + 1}/${apiCalls.length}: Generating ${call.name}...`;
+                    
+                    context.commit("update_create_db_message", progressMessage);
+                    context.commit("update_create_db_progress", ((i + 1) / apiCalls.length) * 100);
+
+                    const apiParams = { 
+                        Mgm_McuID: prm.mgm_mcu_id,
+                        token: one_token() 
+                    };
+                    const resp = await call.func(apiParams);
+
+                    if (resp.status !== "OK") {
+                        if (resp.message === "No data found") {
+                            console.warn(`Skipping step ${i + 1} (${call.name}): No data found.`);
+                        } else {
+                            throw new Error(`Failed at step ${i + 1} (${call.name}): ${resp.message}`);
+                        }
+                    }
+                }
+
+                context.commit("update_msg_success", "Database berhasil dibuat ulang.");
+                context.commit("update_dialog_success", true);
+                context.dispatch("getcountkelainan", { Mgm_McuID: prm.mgm_mcu_id });
+
+            } catch (e) {
+                console.error("Error during database creation:", e);
+                context.commit("update_msg_info", e.message);
+                context.commit("update_open_dialog_info", true);
+            } finally {
+                context.commit("update_loading_create_db", false);
+                context.commit("update_create_db_progress", 0);
+                context.commit("update_create_db_message", "");
             }
         }
 
